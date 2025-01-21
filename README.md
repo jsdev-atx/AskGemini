@@ -29,15 +29,22 @@ python3 -m pip install -r requirements.txt
 ## Setup
 
 1. **Obtain a Gemini API Key:**  Get a Gemini API key from the Google AI Platform.
-2. **Set Environment Variables:** Create a `.env` file (or set the variables directly in your shell) with the following:
+2. ** Set your Gemini API Key in your shell: ** 
+   ```bash
+    export GEMINI_API_KEY="your-key-here"
+    source ~/.bashrc
+    echo $GEMINI_API_KEY
+   ```
+**Note: ** If using MacOS, you're likely using `zsh`. Just change the `source ~/.bashrc` to `source ~/.zshrc`.
+   
+3. **Set Environment Variables:** Create a `.env` file (or set the variables directly in your shell) with the following:
 
    ```
-   GEMINI_API_KEY=your_gemini_api_key
    CODEBASE_PATH=/path/to/your/codebase  # Optional, defaults to the current directory.
    EXCLUDED_PATHS=path/to/exclude1,path/to/exclude2  # Optional, comma-separated list of paths to exclude.
    ```
 
-3. **(Optional) Set EDITOR environment variable:** If you want to use a specific text editor for multiline question input, set the `EDITOR` environment variable (e.g., `export EDITOR=vim` or `export EDITOR=nano`).  If unset, the script defaults to `vi`.
+4. **(Optional) Set EDITOR environment variable:** If you want to use a specific text editor for multiline question input, set the `EDITOR` environment variable (e.g., `export EDITOR=vim` or `export EDITOR=nano`).  If unset, the script defaults to `vi`.
 
 
 ## Usage
