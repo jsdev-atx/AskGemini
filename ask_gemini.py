@@ -1,217 +1,136 @@
 import os
-import re
-import sys
-import logging
 import argparse
-import tempfile
-import subprocess
-
-from dotenv import load_dotenv
 import google.generativeai as genai
+import sys
+import dotenv
+from pathlib import Path
 
-# Suppress gRPC and absl logging messages
-logging.getLogger("grpc").setLevel(logging.ERROR)
-logging.getLogger("absl").setLevel(logging.ERROR)
+dotenv.load_dotenv()
 
+GEMINI_API_KEY = os.environ.get("GEMINI_API_KEY")
+CODEBASE_PATH = os.environ.get("CODEBASE_PATH")
+EXCLUDED_PATHS = os.environ.get("EXCLUDED_PATHS", "").split(",")
+GEMINI_MODEL = os.environ.get("GEMINI_MODEL", "gemini-1.5-flash-8b")
 
-def read_codebase(codebase_path):
-    """
-    Walks through the given codebase path and reads code files 
-    of relevant extensions into a dictionary.
-    Skips paths listed in the EXCLUDED_PATHS environment variable.
-    """
-    # Grab excluded paths from environment (comma-separated).
-    excluded_paths_str = os.getenv("EXCLUDED_PATHS", "")
-    excluded_paths = [p.strip() for p in excluded_paths_str.split(",") if p.strip()]
+if GEMINI_API_KEY is None:
+    raise ValueError("GEMINI_API_KEY environment variable not set")
+if CODEBASE_PATH is None:
+    raise ValueError("CODEBASE_PATH environment variable not set")
+codebase_path_obj = Path(CODEBASE_PATH).resolve()
+if not codebase_path_obj.is_dir():
+    raise ValueError(f"CODEBASE_PATH '{CODEBASE_PATH}' is not a valid directory.")
 
-    code_files = {}
-    for root, _, files in os.walk(codebase_path):
-        # Skip if root contains any of the excluded paths
-        if any(excluded_path in root for excluded_path in excluded_paths):
+genai.configure(api_key=GEMINI_API_KEY)
+
+def read_codebase(codebase_path, excluded_paths):
+    code_files = []
+    excluded_paths = [path.strip() for path in excluded_paths if path.strip()]
+    excluded_dirs = [codebase_path_obj / Path(excluded_path) for excluded_path in excluded_paths]
+
+    for root, _, filenames in os.walk(codebase_path):
+        root_path = Path(root).resolve()
+
+        if any(excluded_dir in root_path.parents or excluded_dir == root_path for excluded_dir in excluded_dirs):
             continue
 
-        for file in files:
-            if file.endswith((".php", ".py", ".js", ".java", ".cpp", ".h")):
-                filepath = os.path.join(root, file)
-                try:
-                    with open(filepath, "r", encoding="utf-8") as f:
-                        code_files[file] = f.read()
-                except UnicodeDecodeError:
-                    print(f"Warning: Skipping file {filepath} due to encoding issues.", file=sys.stderr)
+        for filename in filenames:
+            file_path = root_path / filename
+            try:
+                with file_path.open("r", encoding="utf-8") as f:
+                    content = f.read()
+                    code_files.append(content)
+            except Exception as e:
+                print(f"Warning: Could not read file {file_path}: {e}", file=sys.stderr)
+
     return code_files
 
-
-def determine_language(filename):
-    """
-    Returns a code fence language identifier based on file extension.
-    """
-    if filename.endswith(".php"):
-        return "php"
-    elif filename.endswith(".py"):
-        return "python"
-    elif filename.endswith(".js"):
-        return "javascript"
-    elif filename.endswith(".cpp"):
-        return "cpp"
-    elif filename.endswith(".java"):
-        return "java"
-    elif filename.endswith(".h"):
-        return "cpp"
-    else:
-        return ""
-
-
 def format_code_for_api(code_files):
-    """
-    Formats the code files into GitHub-flavored code blocks
-    for inclusion in the prompt context.
-    """
-    formatted_code = ""
-    for filename, content in code_files.items():
-        formatted_code += f"```{determine_language(filename)}\n{content}\n```\n\n"
-    return formatted_code
+    return "\n".join(code_files)
 
-
-def analyze_codebase(codebase_path, question):
-    """
-    Configures and calls the Gemini API with the given question and codebase.
-    Returns a string with the LLM's response, or None if an error occurred.
-    """
-    # Gemini API key from system environment (more secure).
-    gemini_api_key = os.environ.get("GEMINI_API_KEY")
-    if not gemini_api_key:
-        print("Error: GEMINI_API_KEY not found in environment.", file=sys.stderr)
+def query_gemini(codebase_path, question, excluded_paths):
+    code_files = read_codebase(codebase_path, excluded_paths)
+    if not code_files:
+        print("Error: No code files found to read.", file=sys.stderr)
         return None
 
-    genai.configure(api_key=gemini_api_key)
-    model = genai.GenerativeModel("gemini-1.5-flash")
-
-    code_files = read_codebase(codebase_path)
     context = format_code_for_api(code_files)
     prompt = f"{context}\n\n{question}"
 
     try:
-        response = model.generate_content(prompt)
-
-        if not response.candidates:
-            print("Error: No candidates returned in the response.", file=sys.stderr)
-            return None
-
-        raw_content = response.candidates[0].content
-        if raw_content is None:
-            print("Error: No text content found in the response.", file=sys.stderr)
-            return None
-
-        # Ensure raw_content is a string or convert it to a string
-        if isinstance(raw_content, str):
-            raw_text = raw_content
-        elif hasattr(raw_content, "parts") and hasattr(raw_content.parts, "text"):
-            raw_text = raw_content.parts.text
-        elif isinstance(raw_content, dict):
-            # Attempt to extract 'parts' -> 'text'
-            parts = raw_content.get("parts", {})
-            if isinstance(parts, dict):
-                raw_text = parts.get("text", "")
-            else:
-                # If 'parts' is not a dict, convert to string
-                raw_text = str(parts)
-        else:
-            # Fallback: convert to string
-            raw_text = str(raw_content)
-
-        if not isinstance(raw_text, str):
-            print("Error: Extracted content is not a string.", file=sys.stderr)
-            return None
-
-        # Define regex pattern to extract text within `parts { text: "..."}`
-        pattern = r'parts\s*\{\s*text:\s*"([\s\S]*?)"\s*\}'
-        match = re.search(pattern, raw_text, flags=re.DOTALL)
-        if match:
-            answer_text = match.group(1)
-            # Unescape escaped characters
-            answer_text = bytes(answer_text, "utf-8").decode("unicode_escape")
-        else:
-            # If the pattern doesn't match, assume entire raw_text is desired
-            answer_text = raw_text
-            # Optionally unescape if needed
-            answer_text = bytes(answer_text, "utf-8").decode("unicode_escape")
-
-        return answer_text.strip()
-
+        model = genai.GenerativeModel(GEMINI_MODEL)
+        print(f"Connected to Gemini model '{GEMINI_MODEL}'.")
+    except AttributeError as e:
+        print(f"Error: {e}", file=sys.stderr)
+        return None
     except Exception as e:
-        if "DeadlineExceeded" in str(e):
-            print("Error: Gemini request timed out.", file=sys.stderr)
-        else:
-            print(f"An error occurred: {e}", file=sys.stderr)
+        print(f"Error initializing GenerativeModel: {e}", file=sys.stderr)
         return None
 
+    try:
+        response = model.generate_content(prompt)
+    except Exception as e:
+        print(f"Error during content generation: {e}", file=sys.stderr)
+        return None
 
-def prompt_for_multiline_input():
-    """
-    Opens the default system editor (or uses 'vi' if EDITOR is unset)
-    to let the user input multiline text. Returns the text typed by the user.
-    """
-    with tempfile.NamedTemporaryFile(suffix=".tmp", delete=False) as tf:
-        temp_name = tf.name
+    if not response.candidates:
+        print("Error: No candidates returned in the response.", file=sys.stderr)
+        return None
 
-    editor = os.environ.get("EDITOR", "vi")
-    subprocess.call([editor, temp_name])
+    raw_content = response.text
+    if raw_content is None:
+        print("Error: No text content found in the response.", file=sys.stderr)
+        return None
 
-    with open(temp_name, "r") as tf:
-        text = tf.read()
+    return raw_content
 
-    os.remove(temp_name)
-    return text
+def get_query_from_editor():
+    temp_file = "temp_query.txt"
+    try:
+        with open(temp_file, "w", encoding="utf-8") as f:
+            f.write("")
 
+        if sys.platform.startswith('darwin'):
+            os.system(f"open {temp_file}")
+        elif sys.platform.startswith('win'):
+            os.system(f"start {temp_file}")
+        else:
+            os.system(f"xdg-open {temp_file}")
+
+        input("Press Enter when you have finished editing the query...")
+
+        with open(temp_file, "r", encoding="utf-8") as f:
+            query = f.read().strip()
+    except Exception as e:
+        print(f"Error during query input: {e}", file=sys.stderr)
+        query = ""
+    finally:
+        if os.path.exists(temp_file):
+            os.remove(temp_file)
+
+    return query
 
 def main():
-    # Load .env variables (for CODEBASE_PATH, EXCLUDED_PATHS, etc.)
-    # GEMINI_API_KEY should remain in system environment for security.
-    load_dotenv()
-
-    # Parse command-line arguments
-    parser = argparse.ArgumentParser(description="Analyze a codebase with Gemini LLM.")
-    parser.add_argument(
-        "--question", "-q",
-        help="The question to ask the LLM. If omitted, you can open an editor via --editor.",
-        required=False
-    )
-    parser.add_argument(
-        "--editor", "-e",
-        action="store_true",
-        help="Open an editor for multiline question input."
-    )
-
+    parser = argparse.ArgumentParser(description="Query Gemini with a codebase.")
+    group = parser.add_mutually_exclusive_group(required=True)
+    group.add_argument("-q", "--question", help="The query to ask Gemini.")
+    group.add_argument("-e", "--editor", action="store_true", help="Open an editor to write the query.")
     args = parser.parse_args()
 
-    # Retrieve codebase path from the environment (default to current dir if not set)
-    codebase_path = os.getenv("CODEBASE_PATH", ".")
-
-    # Determine how to get the question
-    if args.question and args.editor:
-        print(
-            "Error: Please provide either --question or --editor, but not both.",
-            file=sys.stderr
-        )
-        sys.exit(1)
-    elif args.question:
+    if args.question:
         question = args.question
     elif args.editor:
-        question = prompt_for_multiline_input()
+        question = get_query_from_editor()
+        if not question:
+            print("Error: No query provided.", file=sys.stderr)
+            sys.exit(1)
+
+    response = query_gemini(codebase_path_obj, question, EXCLUDED_PATHS)
+    if response:
+        print("\nGemini Response:\n")
+        print(response)
     else:
-        print(
-            "Error: No question provided. Use --question <text> or --editor to open a text editor.",
-            file=sys.stderr
-        )
+        print("Failed to generate a response from Gemini.", file=sys.stderr)
         sys.exit(1)
-
-    # Perform the analysis
-    analysis_result = analyze_codebase(codebase_path, question)
-    if analysis_result:
-        print(analysis_result)
-    else:
-        print("No analysis result available.", file=sys.stderr)
-
 
 if __name__ == "__main__":
     main()
